@@ -7,6 +7,34 @@
 #include <time.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <errno.h>
+
+/* Text style definitions */
+#define STYLE_NORMAL    0
+#define STYLE_BOLD      1
+#define STYLE_DIM       2
+#define STYLE_ITALIC    3
+#define STYLE_UNDERLINE 4
+
+/* Color definitions */
+#define COLOR_DEFAULT   0
+#define COLOR_RED       1
+#define COLOR_GREEN     2
+#define COLOR_YELLOW    3
+#define COLOR_BLUE      4
+#define COLOR_MAGENTA   5
+#define COLOR_CYAN      6
+#define COLOR_WHITE     7
+
+/* Style structure */
+typedef struct {
+    unsigned char bold : 1;
+    unsigned char dim : 1;
+    unsigned char italic : 1;
+    unsigned char underline : 1;
+    unsigned char fg_color : 4;
+    unsigned char bg_color : 4;
+} text_style;
 
 /* Data structure for storing a row of text */
 typedef struct erow {
@@ -14,6 +42,7 @@ typedef struct erow {
     char *chars;
     int rsize;
     char *render;
+    text_style *styles;  // Array of style information for each character
 } erow;
 
 /* Global editor config struct to store editor state */
@@ -148,7 +177,14 @@ void editorDrawRows(struct abuf *ab) {
                     padding--;
                 }
                 while (padding--) abAppend(ab, " ", 1);
+                
+                // Display welcome message in bold blue
+                text_style welcome_style = {0};
+                welcome_style.bold = 1;
+                welcome_style.fg_color = COLOR_BLUE;
+                editorRenderStyle(ab, welcome_style);
                 abAppend(ab, welcome, welcomelen);
+                abAppend(ab, "\x1b[0m", 4);  // Reset styles
             } else {
                 abAppend(ab, "~", 1);
             }
@@ -156,7 +192,19 @@ void editorDrawRows(struct abuf *ab) {
             int len = E.row[filerow].rsize - E.coloff;
             if (len < 0) len = 0;
             if (len > E.screencols) len = E.screencols;
-            abAppend(ab, &E.row[filerow].render[E.coloff], len);
+            
+            char *c = &E.row[filerow].render[E.coloff];
+            text_style *styles = &E.row[filerow].styles[E.coloff];
+            text_style current_style = {0};
+            
+            for (int i = 0; i < len; i++) {
+                if (memcmp(&current_style, &styles[i], sizeof(text_style)) != 0) {
+                    editorRenderStyle(ab, styles[i]);
+                    current_style = styles[i];
+                }
+                abAppend(ab, &c[i], 1);
+            }
+            abAppend(ab, "\x1b[0m", 4);  // Reset styles at end of line
         }
 
         abAppend(ab, "\x1b[K", 3);
@@ -228,6 +276,47 @@ void editorProcessKeypress() {
             exit(0);
             break;
 
+        // Style shortcuts
+        case CTRL_KEY('b'):  // Bold
+            {
+                text_style style = {0};
+                style.bold = 1;
+                editorApplyStyle(E.cy, E.cx, E.cx + 1, style);
+            }
+            break;
+            
+        case CTRL_KEY('u'):  // Underline
+            {
+                text_style style = {0};
+                style.underline = 1;
+                editorApplyStyle(E.cy, E.cx, E.cx + 1, style);
+            }
+            break;
+            
+        case CTRL_KEY('i'):  // Italic
+            {
+                text_style style = {0};
+                style.italic = 1;
+                editorApplyStyle(E.cy, E.cx, E.cx + 1, style);
+            }
+            break;
+            
+        case CTRL_KEY('r'):  // Red text
+            {
+                text_style style = {0};
+                style.fg_color = COLOR_RED;
+                editorApplyStyle(E.cy, E.cx, E.cx + 1, style);
+            }
+            break;
+            
+        case CTRL_KEY('g'):  // Green text
+            {
+                text_style style = {0};
+                style.fg_color = COLOR_GREEN;
+                editorApplyStyle(E.cy, E.cx, E.cx + 1, style);
+            }
+            break;
+
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DEL_KEY:
@@ -287,6 +376,10 @@ void editorInsertRow(int at, char *s, size_t len) {
     memcpy(E.row[at].chars, s, len);
     E.row[at].chars[len] = '\0';
 
+    // Initialize styles
+    E.row[at].styles = malloc(len * sizeof(text_style));
+    memset(E.row[at].styles, 0, len * sizeof(text_style));
+
     E.row[at].rsize = 0;
     E.row[at].render = NULL;
     editorUpdateRow(&E.row[at]);
@@ -298,6 +391,7 @@ void editorInsertRow(int at, char *s, size_t len) {
 void editorFreeRow(erow *row) {
     free(row->render);
     free(row->chars);
+    free(row->styles);
 }
 
 void editorDelRow(int at) {
@@ -311,9 +405,12 @@ void editorDelRow(int at) {
 void editorRowInsertChar(erow *row, int at, int c) {
     if (at < 0 || at > row->size) at = row->size;
     row->chars = realloc(row->chars, row->size + 2);
+    row->styles = realloc(row->styles, (row->size + 1) * sizeof(text_style));
     memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    memmove(&row->styles[at + 1], &row->styles[at], (row->size - at) * sizeof(text_style));
     row->size++;
     row->chars[at] = c;
+    memset(&row->styles[at], 0, sizeof(text_style));  // Initialize new style as normal
     editorUpdateRow(row);
     E.dirty++;
 }
@@ -419,6 +516,42 @@ void initEditor() {
     } else {
         E.screenrows = ws.ws_row - 2;  // Leave room for status bar
         E.screencols = ws.ws_col;
+    }
+}
+
+/* Style operations */
+void editorApplyStyle(int row, int start, int end, text_style style) {
+    if (row < 0 || row >= E.numrows) return;
+    erow *r = &E.row[row];
+    if (start < 0) start = 0;
+    if (end > r->size) end = r->size;
+    
+    for (int i = start; i < end; i++) {
+        r->styles[i] = style;
+    }
+    editorUpdateRow(r);
+}
+
+void editorRenderStyle(struct abuf *ab, text_style style) {
+    // Reset all styles first
+    abAppend(ab, "\x1b[0m", 4);
+    
+    // Apply new styles
+    if (style.bold) abAppend(ab, "\x1b[1m", 4);
+    if (style.dim) abAppend(ab, "\x1b[2m", 4);
+    if (style.italic) abAppend(ab, "\x1b[3m", 4);
+    if (style.underline) abAppend(ab, "\x1b[4m", 4);
+    
+    // Apply colors if not default
+    if (style.fg_color != COLOR_DEFAULT) {
+        char color_str[16];
+        snprintf(color_str, sizeof(color_str), "\x1b[3%dm", style.fg_color);
+        abAppend(ab, color_str, strlen(color_str));
+    }
+    if (style.bg_color != COLOR_DEFAULT) {
+        char color_str[16];
+        snprintf(color_str, sizeof(color_str), "\x1b[4%dm", style.bg_color);
+        abAppend(ab, color_str, strlen(color_str));
     }
 }
 
